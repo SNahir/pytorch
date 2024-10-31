@@ -488,6 +488,9 @@ enable_compiler_collectives = os.environ.get("TORCH_COMPILER_COLLECTIVES", "0") 
 # HACK: this is for testing custom ops profiling only
 _custom_ops_profile: Optional[Any] = None
 
+# Disable logger calls to avoid graph breaks
+disable_logs = os.environ.get("DISABLE_LOGS_WHILE_COMPILING", "0") == "1"
+
 if TYPE_CHECKING:
     from torch.utils._config_typing import *  # noqa: F401, F403
 
