@@ -44,6 +44,7 @@ from .runtime_utils import (
     next_power_of_2,
     triton_cache_dir,
     triton_config_to_hashable,
+    triton_hash_to_path_key,
     validate_triton_config,
 )
 
@@ -244,6 +245,16 @@ class CachingAutotuner(KernelInterface):
         )
         self.filename = filename
 
+        # used for profiling
+        self.kernel_hash: str = ""
+
+        # Kernels are stored in the codecache with the filename as a hash of the code.
+        # We rely on this to obtain the kernel hash
+        if self.filename is not None:
+            base_name = os.path.basename(self.filename)
+            if ".py" in base_name:
+                self.kernel_hash = os.path.splitext(base_name)[0]
+
         self.precompile_time_taken_ns = 0
         self.autotune_time_taken_ns = 0
         # Dumps the launch configs after autotuning.
@@ -442,6 +453,7 @@ class CachingAutotuner(KernelInterface):
                 "num_warps": compile_meta["num_warps"],
                 "num_stages": compile_meta["num_stages"],
                 "debug": compile_meta["debug"],
+                "sanitize_overflow": False,  # turn off additional asserts added for overflow checks
             }
             if self.device_props.type == "hip":
                 if "waves_per_eu" in compile_meta:
@@ -461,7 +473,9 @@ class CachingAutotuner(KernelInterface):
         if warm_cache_only:
             binary = triton.compile(*compile_args, **compile_kwargs)
             launcher = None
-            TritonBundler.put(binary.hash, self.triton_meta.get("device", 0))
+            TritonBundler.put(
+                triton_hash_to_path_key(binary.hash), self.triton_meta.get("device", 0)
+            )
             return binary, launcher
 
         # importing from torch is safe now that precompile has returned
@@ -701,7 +715,9 @@ class CachingAutotuner(KernelInterface):
             launcher.fn = self.fn
             launcher.bin = binary
 
-        TritonBundler.put(binary.hash, self.triton_meta.get("device", 0))
+        TritonBundler.put(
+            triton_hash_to_path_key(binary.hash), self.triton_meta.get("device", 0)
+        )
 
         return binary, launcher
 
@@ -823,7 +839,9 @@ class CachingAutotuner(KernelInterface):
         return self.maybe_clone_args(set(), *args, **kwargs)
 
     def benchmark_all_configs(self, *args, **kwargs):
-        with dynamo_timed("CachingAutotuner.benchmark_all_configs"):
+        with dynamo_timed(
+            "CachingAutotuner.benchmark_all_configs", log_pt2_compile_event=True
+        ):
             timings = {
                 launcher: self.bench(launcher, *args, **kwargs)
                 for launcher in self.launchers
@@ -991,11 +1009,13 @@ class CachingAutotuner(KernelInterface):
                 grid_info = str(grid)
             else:
                 grid_info = getattr(grid, "grid_fn_str", "")
+
             with torch._C._profiler._RecordFunctionFast(
                 self.inductor_meta.get("kernel_name", "triton kernel"),
                 args,
                 {
-                    "kernel_file": "" if self.filename is None else self.filename,
+                    "kernel_file": (self.filename or ""),
+                    "kernel_hash": self.kernel_hash,
                     "kernel_backend": "triton",
                     "grid": grid_info,
                     "stream": stream,
@@ -1172,6 +1192,9 @@ def cached_autotune(
 
     mutated_arg_names = inductor_meta.pop("mutated_arg_names", ())
     optimize_mem = inductor_meta.pop("optimize_mem", True)
+
+    if "restore_value" in triton_meta:
+        mutated_arg_names += triton_meta.pop("restore_value")
 
     def decorator(fn):
         # Remove XBLOCK from config if it's not a function argument.
@@ -1786,29 +1809,42 @@ def template(num_stages, num_warps, triton_meta, filename=None, inductor_meta=No
     )
 
 
+def _pop_config_kwargs(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract triton.Config options that should become kwargs"""
+    popped = {}
+    for key in ("num_warps", "num_stages", "num_ctas", "maxnreg"):
+        val = config.pop(key, None)
+        if val is not None:
+            popped[key] = val
+    return popped
+
+
+def fixed_config(config, filename, triton_meta, inductor_meta):
+    """
+    Used when the configuration is already decided at compile time
+    """
+    config = {**config}
+    return cached_autotune(
+        None,
+        [triton.Config(config, **_pop_config_kwargs(config))],
+        triton_meta=triton_meta,
+        inductor_meta=inductor_meta,
+        heuristic_type=HeuristicType.FIXED,
+        filename=filename,
+    )
+
+
 def user_autotune(
     configs, triton_meta, filename=None, inductor_meta=None, custom_kernel=False
 ):
     """
     Compile a user defined triton kernel
     """
-    defaults = inspect.signature(triton.Config).parameters
-    default_num_stages = defaults["num_stages"].default
-    default_num_warps = defaults["num_warps"].default
-
     if len(configs) == 0:
-        configs = [
-            triton.Config(
-                {}, num_stages=default_num_stages, num_warps=default_num_warps
-            )
-        ]
+        configs = [triton.Config({})]
     else:
         configs = [
-            triton.Config(
-                c.get("kwargs", {}),
-                num_stages=c.get("num_stages", default_num_stages),
-                num_warps=c.get("num_warps", default_num_warps),
-            )
+            triton.Config(c.get("kwargs", {}), **_pop_config_kwargs({**c}))
             for c in configs
         ]
     return cached_autotune(
